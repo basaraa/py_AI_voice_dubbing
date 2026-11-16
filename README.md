@@ -12,6 +12,7 @@ An advanced, offline-first local AI dubbing and multi-voice narration studio bui
 ### 🎬 Tab 1: Video Dubbing Studio
 * **Automated Audio Extraction & Separation**:
   * Extracts audio from any container (`.mp4`, `.mkv`, `.avi`, `.mov`, `.webm`, etc.).
+  * **Smart Audio Track Selection**: Automatically probes streams via `ffprobe`, skips existing `AI Dubbing` tracks when re-dubbing MKVs, and preserves the original audio track; includes a compact **Track:** selector for multi-audio videos.
   * Uses **HTDemucs** (`--two-stems vocals`) to isolate clean dialogue while isolating the background music and sound effects (BGM & SFX).
 * **AI Character Diarization & F0 Pitch Profiling**:
   * Offline speaker clustering via **SpeechBrain ECAPA-TDNN** or **Resemblyzer**.
@@ -49,9 +50,16 @@ An advanced, offline-first local AI dubbing and multi-voice narration studio bui
 ---
 
 ### 🎙️ Tab 2: Text Narration & Multi-Voice Speech
-* **Sentence-Level Multi-Voice Synthesis**:
+* **Mode Switcher (Single Text vs. Multi-File Dubbing)**:
+  * Switch seamlessly between **Single Text Narration** and **Multi-File Dubbing** via radio buttons with full in-memory state preservation.
+* **Single Text — Sentence-Level Multi-Voice Synthesis**:
   * Paste text or import `.txt` / `.srt` files; sentences are automatically parsed (supporting English, European punctuation `.!?`, and Japanese/CJK punctuation `。！？「」`).
   * Assign different voices to different sentences or characters in a sortable, multi-select table.
+* **Multi-File Dubbing (`.txt` / `.srt` Batch Mode)**:
+  * Auto-scans `.txt` and `.srt` files in the root folder (with an optional **Recursive Scan** checkbox, unchecked by default) and automatically strips SRT timestamps/tags.
+  * Per-file checkboxes (`☑ Yes` / `☐ No`) and per-file voice assignment (defaulting to `SUPERTONIC_MALE_RANKED[0]`, i.e. `M5`).
+  * Click any file to inspect its sentences; assign row-level voice overrides using `Ctrl`/`Shift` multi-selection (row overrides take priority and are preserved even when changing the file-level voice), with **Reset** buttons to revert to file defaults.
+  * **Zero-Click Auto-Save**: Exports each dubbed file directly to the root directory with timestamped naming (`<filename>_%Y%m%d_%H%M%S.mp3`).
 * **Companion Cache Verification**:
   * Every generated sentence chunk generates a companion `.txt` signature (`[engine:voice:speed]\ntext`).
   * If text or voice changes, only that specific chunk is regenerated; existing chunks are reused seamlessly.
@@ -77,6 +85,8 @@ An advanced, offline-first local AI dubbing and multi-voice narration studio bui
 ```text
 py_AI_voice_dubbing/
 ├── py_ai_voice_dubbing.py          # Application entry point (launches Tkinter GUI)
+├── ARCHITECTURE.md                 # Codebase architecture & module lookup map
+├── AGENTS.md                       # System directives & coding rules
 ├── requirements.txt                # Python dependencies
 ├── README.md
 ├── voices/                         # Custom reference audio samples (.wav/.mp3) for XTTS voice cloning
@@ -84,11 +94,17 @@ py_AI_voice_dubbing/
 └── modules/                        # Modular core package
     ├── __init__.py
     ├── config.py                   # Runtime patches, device/CUDA config, paths, and voice catalogs
-    ├── audio_utils.py              # FFmpeg wrappers, F0 pitch estimation, VRAM helpers, Demucs separation
+    ├── audio_utils.py              # FFmpeg/ffprobe wrappers, track detection, F0 pitch, VRAM, Demucs separation
     ├── diarization.py              # ECAPA-TDNN/Resemblyzer speaker clustering & Known Voice Profile matching
     ├── subtitles.py                # SRT/ASS parsing, sentence splitting, and project.json state sync
     ├── mixer.py                    # Anti-collision dialogue assembly, adaptive SFX mixer & video export
-    ├── gui.py                      # Tkinter UI (Tab 1: Video Dubbing Studio, Tab 2: Text Narration)
+    ├── gui/                        # Procedural Tkinter GUI package
+    │   ├── __init__.py             # create_app() window & notebook assembly
+    │   ├── status_log_panel.py     # Shared bottom progress bar, VRAM monitor & log console
+    │   ├── tab1_video_dubbing.py   # Tab 1: Video Dubbing Studio & batch video processor
+    │   ├── tab2_narration_host.py  # Tab 2 Host: Radio mode switcher (Single vs. Multi-File)
+    │   ├── tab2_single_text.py     # Tab 2A: Single text/SRT narration & multi-voice speech
+    │   └── tab2_multi_file.py      # Tab 2B: Multi-file .txt/.srt dubbing with row overrides
     └── tts/                        # Separated TTS engine backends
         ├── __init__.py             # DynamicDubbingEngine router & voice sample preview player
         ├── supertonic_engine.py    # Local ONNX Supertonic TTS backend
@@ -204,6 +220,7 @@ voice_dub/
 
 1. **Select Video File**:
    * Click **Browse...** to pick your input video (`.mp4`, `.mkv`, etc.).
+   * If the video contains multiple audio streams (or an existing `AI Dubbing` track), the **Track:** selector automatically picks the first non-AI original audio track (you can also switch it manually).
 2. **Select Subtitles**:
    * **Mode A (Existing Subtitles)**: Pick your `.srt` / `.ass` subtitle file translated into the target language.
    * **Mode B (Auto-Transcribe)**: Auto-transcribes the original audio using Whisper if no subtitles are available.
@@ -236,6 +253,7 @@ To dub multiple episodes or clips at once:
 
 ### Tab 2: Text Narration & Multi-Voice Speech
 
+#### Single Text Narration
 1. Choose your language in **Language** (`English`, `Czech`, `Slovak`, `Japanese`, etc.).
 2. Choose a **Default Voice** and speech **Speed**.
 3. Type or paste text into the main text box, or click **📂 Load from File (.txt / .srt)**.
@@ -243,6 +261,14 @@ To dub multiple episodes or clips at once:
 5. Highlight individual sentences with `Ctrl` or `Shift`, select different voices, and click **✓ Apply to Selected**.
 6. Click **🎙️ Generate Speech (MP3 160 kbps)**.
 7. Click **▶ Play Generated MP3** or **💾 Save MP3 As...** to export your audio.
+
+#### Multi-File Dubbing (`.txt` / `.srt`)
+1. Select **📁 Multi-File Dubbing** in the mode switcher at the top of Tab 2 (switching modes preserves all your current work in memory).
+2. All `.txt` and `.srt` files in the current directory are listed automatically (check **Recursive Scan** + **🔄 Rescan Files** if you want to include subdirectories).
+3. Toggle which files to dub using the **Dub?** column (`☑ Yes` / `☐ No`, click or press `Space`).
+4. Assign a voice per file using **File Voice** + **✓ Apply to File(s)** (every file defaults to `M5` from `SUPERTONIC_MALE_RANKED`).
+5. Click any file to view its sentences below; use `Shift` / `Ctrl` to select specific sentences and assign row-level voice overrides (**✓ Apply to Selected Rows**). Row-level overrides have priority and are preserved even if you later change the file-level voice. Use **↺ Reset Selected to File Default** or **↺ Reset All Rows of File** to revert.
+6. Click **🎙️ Generate Multi-File Dubbing (Zero-Click Auto-Save)** — all dubbed MP3s are automatically saved to the root directory as `<filename>_%Y%m%d_%H%M%S.mp3`.
 
 ---
 
