@@ -1,10 +1,38 @@
-from modules.config import *
+"""
+Tab 1: Video Dubbing Studio Component (Supertonic, Edge and Clone)
+---------------------------------------------------------------
+Procedural component for Tab 1:
+- Video and subtitle input and configuration
+- Character diarization with pitch profiling and voice assignment
+- Subtitle table with extended selection, sorting, and per-line voice assignment
+- Dynamic audio mixer with Foley passthrough, ducking, and video muxing
+- Batch folder dubbing with automatic video/subtitle pairing
+"""
+
+import os
+import re
+import json
+import time
+import math
+import shutil
+import threading
+import subprocess
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import numpy as np
+import soundfile as sf
+import sounddevice as sd
+
+from modules.config import (
+    SCRIPT_DIR, VOICES_DIR, SPEAKER_PROFILES_DIR, PROFILES_META_FILE,
+    SAMPLE_RATE, DEVICE, SUPERTONIC_MALE_RANKED
+)
 from modules.audio_utils import (
-    run_cmd, get_vram_status, clear_vram, get_audio_duration,
-    format_timestamp_srt, scan_voices_directory, get_all_available_voices,
-    resolve_voice_for_subtitle, sort_treeview, extract_audio_from_video,
-    separate_sources, get_or_create_reference_transcription,
-    trim_audio_silence, convert_to_mp3_160k
+    run_cmd, clear_vram, format_timestamp_srt, scan_voices_directory,
+    get_all_available_voices, resolve_voice_for_subtitle, sort_treeview,
+    extract_audio_from_video, separate_sources,
+    get_or_create_reference_transcription, get_audio_duration,
+    get_video_audio_tracks, pick_best_source_audio_track
 )
 from modules.diarization import (
     load_speaker_profiles_meta, save_speaker_profiles_meta, _safe_profile_path,
@@ -15,7 +43,7 @@ from modules.diarization import (
 from modules.subtitles import (
     parse_srt_file, split_text_into_sentences_list, create_project_structure,
     load_or_init_project, save_project, sync_subtitles_with_disk,
-    find_matching_subtitle, export_working_file, extract_clean_text_from_srt,
+    export_working_file, extract_clean_text_from_srt,
     import_working_file, is_batch_video_up_to_date
 )
 from modules.mixer import (
@@ -25,11 +53,19 @@ from modules.mixer import (
 )
 from modules.tts import DynamicDubbingEngine, play_any_voice_sample
 
-def create_app():
-    root = tk.Tk()
-    root.title("Local AI Video Dubbing & Localization Studio")
-    root.geometry("1440x960")
-    root.minsize(960, 680)
+
+def create_tab1_video_dubbing(parent_notebook, root, log_cb=print, prog_var=None, on_voice_added=None):
+    tab_dubbing = ttk.Frame(parent_notebook)
+    parent_notebook.add(tab_dubbing, text=" 🎬 1. Video Dubbing Studio (Supertonic, Edge & Clone) ")
+
+    if prog_var is None:
+        class _DummyProg:
+            def config(self, *args, **kwargs):
+                pass
+        prog_var = _DummyProg()
+
+    def log(msg):
+        log_cb(msg)
 
     dub_state = {
         "video_path": "",
@@ -41,35 +77,9 @@ def create_app():
         "cancel_requested": False
     }
 
-    narr_state = {
-        "cancel_requested": False,
-        "last_mp3": ""
-    }
-
-    narr_phrases = []
-
-    log_queue = queue.Queue()
-
-    style = ttk.Style()
-    style.theme_use("clam")
-    style.configure("Treeview", rowheight=23)
-    style.configure("TButton", padding=3)
-    style.configure("Accent.TButton", font=('Segoe UI', 9, 'bold'))
-
-    notebook = ttk.Notebook(root)
-    notebook.pack(fill="both", expand=True, padx=8, pady=(3, 2))
-
-    tab_dubbing = ttk.Frame(notebook)
-    tab_narration = ttk.Frame(notebook)
-
-    notebook.add(tab_dubbing, text=" 🎬 1. Video Dubbing Studio (Supertonic, Edge & Clone) ")
-    notebook.add(tab_narration, text=" 🎙️ 2. Text Narration & Multi-Voice Speech ")
-
-    # Sort states for Treeview tables
     sub_tree_sort_state = {"col": None, "reverse": False}
-    phrase_tree_sort_state = {"col": None, "reverse": False}
+    spk_tree_sort_state = {"col": None, "reverse": False}
 
-    # ==========================================================================
     # TAB 1: VIDEO DUBBING STUDIO
     # ==========================================================================
     top_frame = ttk.LabelFrame(tab_dubbing, text=" 1. Input Files & Configuration ", padding=5)
@@ -94,6 +104,44 @@ def create_app():
             dub_state["data"]["sub_path"] = matched_sub
             log(f"[Subtitles] Automatically loaded matching subtitles: {os.path.basename(matched_sub)}")
 
+    audio_track_map = {"0: Default": 0}
+
+    def refresh_audio_tracks(v_path):
+        audio_track_map.clear()
+        tracks = get_video_audio_tracks(v_path)
+        if not tracks:
+            audio_track_map["0: Default"] = 0
+            audio_track_combo["values"] = ["0: Default"]
+            audio_track_combo.set("0: Default")
+            return 0
+        disp_list = []
+        best_idx = pick_best_source_audio_track(tracks)
+        best_disp = None
+        for t in tracks:
+            lbl = t["title"] or f"Audio {t['index'] + 1}"
+            tag = " [AI Dub - Ignored]" if t["is_ai_dub"] else ""
+            disp = f"{t['index']}: {lbl} ({t['language']}, {t['codec']}){tag}"
+            disp_list.append(disp)
+            audio_track_map[disp] = t["index"]
+            if t["index"] == best_idx:
+                best_disp = disp
+        audio_track_combo["values"] = disp_list
+        if best_disp:
+            audio_track_combo.set(best_disp)
+        elif disp_list:
+            audio_track_combo.set(disp_list[0])
+        if len(tracks) > 1 and any(t["is_ai_dub"] for t in tracks):
+            log(f"[Audio] AI Dubbing track detected & ignored. Auto-selected track #{best_idx}.")
+        return best_idx
+
+    def get_selected_audio_track_index(v_path, is_batch=False):
+        if is_batch:
+            return pick_best_source_audio_track(get_video_audio_tracks(v_path))
+        sel_disp = audio_track_var.get()
+        if sel_disp in audio_track_map:
+            return audio_track_map[sel_disp]
+        return pick_best_source_audio_track(get_video_audio_tracks(v_path))
+
     def browse_video():
         fn = filedialog.askopenfilename(filetypes=[("Video/Audio", "*.mp4 *.mkv *.avi *.mov *.mp3 *.wav")])
         if fn:
@@ -101,6 +149,7 @@ def create_app():
             video_entry.insert(0, fn)
             init_project_state(fn)
             auto_load_matching_subtitles(fn)
+            refresh_audio_tracks(fn)
 
     def on_video_entry_change(event=None):
         v = video_entry.get().strip()
@@ -108,6 +157,7 @@ def create_app():
             init_project_state(v)
             if not sub_entry.get().strip():
                 auto_load_matching_subtitles(v)
+            refresh_audio_tracks(v)
 
     video_entry.bind("<FocusOut>", on_video_entry_change)
     video_entry.bind("<Return>", on_video_entry_change)
@@ -115,6 +165,10 @@ def create_app():
     vid_btn_box = ttk.Frame(top_frame)
     vid_btn_box.grid(row=0, column=2, padx=(4, 0), pady=2, sticky="w")
     ttk.Button(vid_btn_box, text="Browse...", command=browse_video).pack(side="left")
+    ttk.Label(vid_btn_box, text="Track:").pack(side="left", padx=(6, 2))
+    audio_track_var = tk.StringVar(value="0: Default")
+    audio_track_combo = ttk.Combobox(vid_btn_box, textvariable=audio_track_var, values=["0: Default"], width=24, state="readonly")
+    audio_track_combo.pack(side="left", padx=(0, 2))
 
     mode_var = tk.StringVar(value="EXISTING_SRT")
     ttk.Radiobutton(top_frame, text="Mode A: Existing subtitles in target language (.srt/.ass)", variable=mode_var, value="EXISTING_SRT").grid(row=1, column=1, sticky="w", pady=1)
@@ -137,7 +191,7 @@ def create_app():
     whisper_sub_btn.pack(side="left", padx=(4, 0))
 
     settings_frame = ttk.Frame(top_frame)
-    settings_frame.grid(row=4, column=1, sticky="w", pady=3)
+    settings_frame.grid(row=4, column=1, columnspan=2, sticky="w", pady=3)
 
     ttk.Label(settings_frame, text="Default Engine:").pack(side="left", padx=(0, 2))
     engine_var = tk.StringVar(value="Supertonic (Local)")
@@ -178,7 +232,7 @@ def create_app():
     ttk.Checkbutton(settings_frame, text="Force re-analyze characters", variable=force_reanalyze_var).pack(side="left", padx=8)
 
     vol_frame = ttk.Frame(top_frame)
-    vol_frame.grid(row=5, column=1, sticky="w", pady=(3, 2))
+    vol_frame.grid(row=5, column=1, columnspan=2, sticky="w", pady=(3, 2))
 
     ttk.Label(vol_frame, text="Dubbing Volume:").pack(side="left", padx=(0, 2))
     dlg_vol_var = tk.DoubleVar(value=0.90)
@@ -923,306 +977,6 @@ def create_app():
     cancel_btn = ttk.Button(btn_row, text="⏹ Cancel", state="disabled")
     cancel_btn.pack(side="right", padx=5)
 
-    # ==========================================================================
-    # TAB 2: TEXT NARRATION & VIACHLASOVÝ PREDNES
-    # ==========================================================================
-    narr_top = ttk.LabelFrame(tab_narration, text=" 1. Language & Default Voice (Supertonic, Edge & Clone) ", padding=8)
-    narr_top.pack(fill="x", padx=10, pady=3)
-
-    cfg_bar = ttk.Frame(narr_top)
-    cfg_bar.pack(fill="x", pady=2)
-
-    ttk.Label(cfg_bar, text="Language:").pack(side="left", padx=(5, 2))
-    narr_lang_combo = ttk.Combobox(cfg_bar, values=["cs (Czech)", "sk (Slovak)", "ja (Japanese)", "en (English)", "de (German)", "pl (Polish)"], width=15, state="readonly")
-    narr_lang_combo.set("cs (Czech)")
-    narr_lang_combo.pack(side="left", padx=2)
-
-    ttk.Label(cfg_bar, text="Default Voice:").pack(side="left", padx=(12, 2))
-    voice_combo = ttk.Combobox(cfg_bar, width=40, state="readonly")
-    voice_combo.pack(side="left", padx=2)
-
-    ttk.Label(cfg_bar, text="Speed:").pack(side="left", padx=(12, 2))
-    speed_combo = ttk.Combobox(cfg_bar, values=["0.85", "0.90", "0.95", "1.0", "1.05", "1.10"], width=5)
-    speed_combo.set("1.0")
-    speed_combo.pack(side="left", padx=2)
-
-    voice_mapping_tab2 = {}
-
-    def update_narr_voices_dropdown(event=None):
-        nonlocal voice_mapping_tab2
-        cat, vmap = get_all_available_voices(narr_lang_combo.get().split()[0])
-        voice_mapping_tab2 = vmap
-        voice_combo['values'] = cat
-        if cat and not voice_combo.get():
-            voice_combo.set(cat[0])
-        phrase_voice_combo['values'] = cat
-        if cat and not phrase_voice_combo.get():
-            phrase_voice_combo.set(cat[0])
-
-    narr_lang_combo.bind("<<ComboboxSelected>>", lambda e: [update_narr_voices_dropdown(), parse_and_update_tab2_phrases(force_default=False)])
-
-    btn_voice_row = ttk.Frame(narr_top)
-    btn_voice_row.pack(fill="x", pady=(4, 2))
-
-    def play_tab2_voice():
-        chosen = voice_combo.get()
-        if not chosen:
-            messagebox.showwarning("Voice", "Please select a voice from the list.")
-            return
-        ok, msg = play_any_voice_sample(chosen, target_lang=narr_lang_combo.get().split()[0], log_cb=log)
-        if not ok:
-            messagebox.showwarning("Upozornenie", msg)
-
-    def add_custom_voice_tab2():
-        fn = filedialog.askopenfilename(filetypes=[("Audio Files", "*.wav *.mp3 *.flac *.ogg *.m4a")])
-        if fn:
-            clean_name = os.path.splitext(os.path.basename(fn))[0] + ".wav"
-            clean_wav = os.path.join(VOICES_DIR, clean_name)
-            cmd = ["ffmpeg", "-y", "-i", fn, "-ar", str(SAMPLE_RATE), "-ac", "1", clean_wav]
-            run_cmd(cmd)
-            
-            # Kontrola a skopírovanie .txt súboru, ak existuje
-            src_txt = os.path.splitext(fn)[0] + ".txt"
-            if os.path.exists(src_txt):
-                shutil.copy2(src_txt, os.path.splitext(clean_wav)[0] + ".txt")
-
-            update_narr_voices_dropdown()
-            update_tab1_voices_dropdown()
-            update_spk_voices_dropdown()
-            messagebox.showinfo("Success", f"Voice added to ./voices/{clean_name}")
-
-    ttk.Button(btn_voice_row, text="▶ Preview Default Voice", command=play_tab2_voice).pack(side="left", padx=3)
-    ttk.Button(btn_voice_row, text="➕ Add Custom Voice (.wav/.mp3)", command=add_custom_voice_tab2).pack(side="left", padx=3)
-    ttk.Button(btn_voice_row, text="📁 Open voices/ Folder", command=lambda: os.startfile(VOICES_DIR) if os.name == 'nt' else subprocess.run(['xdg-open', VOICES_DIR])).pack(side="left", padx=3)
-
-    # 2. Vstup hlavného textu
-    narr_cfg = ttk.LabelFrame(tab_narration, text=" 2. Main Text Input ", padding=6)
-    narr_cfg.pack(fill="x", padx=10, pady=3)
-
-    def load_narr_file():
-        fn = filedialog.askopenfilename(filetypes=[("Text & Subtitle Files", "*.txt *.srt *.vtt"), ("All Files", "*.*")])
-        if fn:
-            try:
-                if fn.lower().endswith((".srt", ".vtt")):
-                    content = extract_clean_text_from_srt(fn)
-                else:
-                    with open(fn, 'r', encoding='utf-8-sig', errors='replace') as f:
-                        raw = f.read()
-                    # If user chose a file with SRT timestamps structure
-                    if re.search(r'\d+\s*\n\d{2}:\d{2}:\d{2}[,\.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,\.]\d{3}', raw) or '-->' in raw:
-                        content = extract_clean_text_from_srt(raw)
-                    else:
-                        content = raw
-                narr_text_box.delete("1.0", tk.END)
-                narr_text_box.insert("1.0", content)
-                parse_and_update_tab2_phrases(force_default=False)
-            except Exception as e:
-                messagebox.showwarning("Notice", f"Error: {e}")
-
-    def clean_pasted_subtitles():
-        current = narr_text_box.get("1.0", tk.END).strip()
-        if '-->' in current:
-            cleaned = extract_clean_text_from_srt(current)
-            narr_text_box.delete("1.0", tk.END)
-            narr_text_box.insert("1.0", cleaned)
-            parse_and_update_tab2_phrases(force_default=False)
-            messagebox.showinfo("Cleaned", "Subtitle timing and line numbers stripped successfully.")
-        else:
-            messagebox.showinfo("Notice", "No subtitle timestamps ('-->') detected in text.")
-
-    top_txt_bar = ttk.Frame(narr_cfg)
-    top_txt_bar.pack(fill="x", pady=2)
-    ttk.Label(top_txt_bar, text="Type or paste text below (automatically split into sentences):").pack(side="left")
-    btn_bar = ttk.Frame(top_txt_bar)
-    btn_bar.pack(side="right")
-    ttk.Button(btn_bar, text="🧹 Clean Timings", command=clean_pasted_subtitles).pack(side="left", padx=2)
-    ttk.Button(btn_bar, text="📂 Load from File (.txt / .srt)", command=load_narr_file).pack(side="left", padx=2)
-
-    narr_text_box = tk.Text(narr_cfg, height=5, wrap="word", font=("Segoe UI", 10))
-    narr_text_box.pack(fill="both", expand=True, padx=4, pady=3)
-    
-    default_text = "Azeroth calls! Deep in the forests of Ashenvale, the drums of war thunder across the land! Thrall, Warchief of the Horde, rallies his fiercest champions at the gates of Orgrimmar!"
-    narr_text_box.insert("1.0", default_text)
-
-    # 3. Zoznam viet & priradenie hlasov jednotlivým frázam (Tab 2)
-    narr_phrase_frame = ttk.LabelFrame(tab_narration, text=" 3. Multi-Voice Phrase Assignment (Ctrl/Shift selection, sortable columns) ", padding=6)
-    narr_phrase_frame.pack(fill="both", expand=True, padx=10, pady=3)
-
-    phrase_toolbar = ttk.Frame(narr_phrase_frame)
-    phrase_toolbar.pack(fill="x", pady=(0, 4))
-
-    ttk.Label(phrase_toolbar, text="Voice for selected phrases:").pack(side="left", padx=(2, 4))
-    phrase_voice_combo = ttk.Combobox(phrase_toolbar, width=40, state="readonly")
-    phrase_voice_combo.pack(side="left", padx=2)
-
-    def parse_and_update_tab2_phrases(force_default=False):
-        raw_text = narr_text_box.get("1.0", tk.END).strip()
-        if not raw_text:
-            narr_phrases.clear()
-            for r in phrase_tree.get_children():
-                phrase_tree.delete(r)
-            return
-
-        sentences = split_text_into_sentences_list(raw_text)
-        cur_cat, cur_map = get_all_available_voices(narr_lang_combo.get().split()[0])
-        def_label = voice_combo.get()
-        if not def_label and cur_cat:
-            def_label = cur_cat[0]
-        def_info = cur_map.get(def_label, {"type": "supertonic", "voice_id": "M1", "label": def_label})
-
-        # Zachovanie predchádzajúcich priradení hlasov pre rovnaké vety
-        old_by_idx = {i: p for i, p in enumerate(narr_phrases)}
-        old_by_text = {p["text"].strip(): p for p in narr_phrases}
-
-        new_phrases = []
-        for idx, s in enumerate(sentences):
-            s_clean = s.strip()
-            v_label = def_label
-            v_info = def_info
-
-            if not force_default:
-                if idx in old_by_idx and old_by_idx[idx]["text"].strip() == s_clean:
-                    v_label = old_by_idx[idx]["voice_label"]
-                    v_info = old_by_idx[idx]["voice_info"]
-                elif s_clean in old_by_text:
-                    v_label = old_by_text[s_clean]["voice_label"]
-                    v_info = old_by_text[s_clean]["voice_info"]
-
-            new_phrases.append({
-                "id": idx + 1,
-                "text": s_clean,
-                "voice_label": v_label,
-                "voice_info": v_info
-            })
-
-        narr_phrases.clear()
-        narr_phrases.extend(new_phrases)
-
-        for r in phrase_tree.get_children():
-            phrase_tree.delete(r)
-
-        for p in narr_phrases:
-            phrase_tree.insert("", tk.END, iid=str(p["id"]), values=(p["id"], p["voice_label"], p["text"]))
-
-    def assign_voice_to_selected_phrases():
-        sel = phrase_tree.selection()
-        if not sel:
-            messagebox.showinfo("Selection", "Select at least one sentence from the table (Ctrl/Shift selection supported).")
-            return
-        chosen = phrase_voice_combo.get()
-        if not chosen:
-            messagebox.showinfo("Voice", "Please select a voice from the dropdown list.")
-            return
-
-        cur_cat, cur_map = get_all_available_voices(narr_lang_combo.get().split()[0])
-        chosen_info = cur_map.get(chosen, {"type": "supertonic", "voice_id": "M1", "label": chosen})
-
-        phrase_dict = {str(p["id"]): p for p in narr_phrases}
-        for item_id in sel:
-            if str(item_id) in phrase_dict:
-                phrase_dict[str(item_id)]["voice_label"] = chosen
-                phrase_dict[str(item_id)]["voice_info"] = chosen_info
-            phrase_tree.set(item_id, "voice", chosen)
-
-        log(f"[Narration] Voice '{chosen}' assigned to {len(sel)} sentences.")
-
-    def reset_all_phrases_to_default():
-        parse_and_update_tab2_phrases(force_default=True)
-        log("[Narration] Default voice applied to all sentences.")
-
-    def play_tab2_phrase_voice_preview():
-        chosen = phrase_voice_combo.get()
-        if not chosen:
-            messagebox.showinfo("Voice", "Please select a voice from the dropdown list.")
-            return
-        ok, msg = play_any_voice_sample(chosen, target_lang=narr_lang_combo.get().split()[0], log_cb=log)
-        if not ok:
-            messagebox.showwarning("Upozornenie", msg)
-
-    ttk.Button(phrase_toolbar, text="✓ Apply to Selected (Ctrl/Shift)", style="Accent.TButton", command=assign_voice_to_selected_phrases).pack(side="left", padx=4)
-    ttk.Button(phrase_toolbar, text="🔄 Parse Sentences", command=lambda: parse_and_update_tab2_phrases(force_default=False)).pack(side="left", padx=3)
-    ttk.Button(phrase_toolbar, text="↺ Reset All to Default", command=reset_all_phrases_to_default).pack(side="left", padx=3)
-    ttk.Button(phrase_toolbar, text="▶ Preview Voice", command=play_tab2_phrase_voice_preview).pack(side="left", padx=3)
-    ttk.Button(phrase_toolbar, text="Select All", command=lambda: phrase_tree.selection_set(phrase_tree.get_children())).pack(side="left", padx=3)
-
-    phrase_columns = ("id", "voice", "text")
-    phrase_tree = ttk.Treeview(narr_phrase_frame, columns=phrase_columns, show="headings", height=8, selectmode="extended")
-
-    phrase_tree.heading("id", text="#", command=lambda: sort_treeview(phrase_tree, "id", phrase_tree_sort_state))
-    phrase_tree.heading("voice", text="Assigned Voice", command=lambda: sort_treeview(phrase_tree, "voice", phrase_tree_sort_state))
-    phrase_tree.heading("text", text="Sentence / Phrase Text", command=lambda: sort_treeview(phrase_tree, "text", phrase_tree_sort_state))
-
-    phrase_tree.column("id", width=45, anchor="center")
-    phrase_tree.column("voice", width=260, anchor="w")
-    phrase_tree.column("text", width=680, anchor="w")
-
-    phrase_tree.pack(side="left", fill="both", expand=True)
-    phrase_scroll = ttk.Scrollbar(narr_phrase_frame, orient="vertical", command=phrase_tree.yview)
-    phrase_tree.configure(yscrollcommand=phrase_scroll.set)
-    phrase_scroll.pack(side="right", fill="y")
-
-    phrase_tree.bind("<Control-a>", lambda e: phrase_tree.selection_set(phrase_tree.get_children()))
-    phrase_tree.bind("<Double-1>", lambda e: assign_voice_to_selected_phrases())
-
-    # Debounce for text editing in Tab 2
-    _typing_timer = None
-    def on_narr_text_modified(event=None):
-        nonlocal _typing_timer
-        if _typing_timer is not None:
-            root.after_cancel(_typing_timer)
-        _typing_timer = root.after(700, lambda: parse_and_update_tab2_phrases(force_default=False))
-
-    narr_text_box.bind("<KeyRelease>", on_narr_text_modified)
-
-    # 4. Spodné akcie pre Tab 2
-    narr_action_f = ttk.Frame(tab_narration)
-    narr_action_f.pack(fill="x", padx=10, pady=5)
-
-    narr_gen_btn = ttk.Button(narr_action_f, text="🎙️ Generate Speech (MP3 160 kbps)", style="Accent.TButton")
-    narr_gen_btn.pack(side="left", padx=5)
-
-    narr_play_out_btn = ttk.Button(narr_action_f, text="▶ Play Generated MP3", state="disabled")
-    narr_play_out_btn.pack(side="left", padx=5)
-
-    narr_save_btn = ttk.Button(narr_action_f, text="💾 Save MP3 As...", state="disabled")
-    narr_save_btn.pack(side="left", padx=5)
-
-    narr_cancel_btn = ttk.Button(narr_action_f, text="⏹ Cancel", state="disabled")
-    narr_cancel_btn.pack(side="right", padx=5)
-
-    # ==========================================================================
-    # SPOLOČNÝ PANEL: PROGRESS & LOGS
-    # ==========================================================================
-    bottom_frame = ttk.LabelFrame(root, text=" System Status & Log ", padding=4)
-    bottom_frame.pack(before=notebook, side="bottom", fill="x", padx=10, pady=(2, 4))
-
-    prog_var = ttk.Progressbar(bottom_frame, mode="determinate")
-    prog_var.pack(fill="x", padx=5, pady=2)
-
-    status_row = ttk.Frame(bottom_frame)
-    status_row.pack(fill="x", padx=5)
-    
-    status_lbl = ttk.Label(status_row, text="Ready.", font=('Segoe UI', 9))
-    status_lbl.pack(side="left")
-
-    vram_lbl = ttk.Label(status_row, text=get_vram_status(), font=('Segoe UI', 8, 'italic'))
-    vram_lbl.pack(side="right")
-
-    log_txt = tk.Text(bottom_frame, height=5, bg="#1e1e1e", fg="#d4d4d4", font=("Consolas", 8))
-    log_txt.pack(fill="both", expand=True, padx=5, pady=3)
-
-    def log(msg):
-        log_queue.put(msg)
-
-    def process_logs():
-        while not log_queue.empty():
-            msg = log_queue.get_nowait()
-            log_txt.insert(tk.END, msg + "\n")
-            log_txt.see(tk.END)
-            status_lbl.config(text=msg)
-            vram_lbl.config(text=get_vram_status())
-        root.after(120, process_logs)
-
     def init_project_state(video_path):
         folders, proj_file = create_project_structure(video_path)
         dub_state["video_path"] = video_path
@@ -1320,10 +1074,24 @@ def create_app():
             if dub_state["cancel_requested"]:
                 return False
 
+            src_audio_idx = get_selected_audio_track_index(v_path, is_batch=is_batch)
+            dub_state["data"]["source_audio_index"] = src_audio_idx
+            prev_idx = dub_state["data"].get("extracted_audio_stream_index")
+
             extracted_audio = os.path.join(dub_state["folders"]["audio"], "extracted_audio.wav")
-            if not os.path.exists(extracted_audio):
-                log("[Audio] Extracting audio track...")
-                extract_audio_from_video(v_path, extracted_audio)
+            track_changed = (prev_idx is not None and prev_idx != src_audio_idx)
+            if not os.path.exists(extracted_audio) or track_changed:
+                log(f"[Audio] Extracting audio track #{src_audio_idx}...")
+                extract_audio_from_video(v_path, extracted_audio, audio_stream_index=src_audio_idx)
+                if track_changed:
+                    for sep_f in ("vocals.wav", "bgm.wav"):
+                        sp = os.path.join(dub_state["folders"]["separation"], sep_f)
+                        if os.path.exists(sp):
+                            try:
+                                os.remove(sp)
+                            except Exception:
+                                pass
+            dub_state["data"]["extracted_audio_stream_index"] = src_audio_idx
             dub_state["data"]["extracted_audio"] = extracted_audio
 
             if dub_state["cancel_requested"]:
@@ -1625,6 +1393,20 @@ def create_app():
                 return False
 
             v_path = dub_state["video_path"]
+            src_audio_idx = get_selected_audio_track_index(v_path, is_batch=is_batch)
+            dub_state["data"]["source_audio_index"] = src_audio_idx
+            prev_idx = dub_state["data"].get("extracted_audio_stream_index")
+            if prev_idx is not None and prev_idx != src_audio_idx:
+                extracted_audio = os.path.join(dub_state["folders"]["audio"], "extracted_audio.wav")
+                log(f"[Audio] Re-extracting source audio track #{src_audio_idx}...")
+                extract_audio_from_video(v_path, extracted_audio, audio_stream_index=src_audio_idx)
+                dub_state["data"]["extracted_audio"] = extracted_audio
+                if sep_var.get():
+                    separate_sources(extracted_audio, dub_state["folders"]["separation"], log_cb=log)
+                    dub_state["data"]["vocals_audio"] = os.path.join(dub_state["folders"]["separation"], "vocals.wav")
+                    dub_state["data"]["bgm_audio"] = os.path.join(dub_state["folders"]["separation"], "bgm.wav")
+            dub_state["data"]["extracted_audio_stream_index"] = src_audio_idx
+
             total_video_dur = get_audio_duration(v_path)
             
             v_rms = 0.075
@@ -1655,7 +1437,8 @@ def create_app():
             base_vname = os.path.splitext(os.path.basename(v_path))[0]
             out_video = os.path.join(dub_state["folders"]["output"], f"{base_vname}_dubbed_{tgt_lang}_{ts_str}.mkv")
 
-            mix_and_export_video(v_path, mixed_master_wav, out_video, target_lang=tgt_lang)
+            src_audio_idx = dub_state["data"].get("source_audio_index", 0)
+            mix_and_export_video(v_path, mixed_master_wav, out_video, target_lang=tgt_lang, source_audio_index=src_audio_idx)
 
             prog_var.config(value=100)
             dub_state["data"]["steps_completed"]["final_export"] = True
@@ -1697,10 +1480,12 @@ def create_app():
             log("[Whisper] Starting automated subtitle transcription...")
             prog_var.config(value=10)
 
+            src_audio_idx = get_selected_audio_track_index(v, is_batch=False)
             extracted_audio = os.path.join(dub_state["folders"]["audio"], "extracted_audio.wav")
             if not os.path.exists(extracted_audio):
-                log("[Audio] Extracting audio track from video...")
-                extract_audio_from_video(v, extracted_audio)
+                log(f"[Audio] Extracting audio track #{src_audio_idx} from video...")
+                extract_audio_from_video(v, extracted_audio, audio_stream_index=src_audio_idx)
+                dub_state["data"]["extracted_audio_stream_index"] = src_audio_idx
             dub_state["data"]["extracted_audio"] = extracted_audio
 
             if dub_state["cancel_requested"]:
@@ -1902,158 +1687,6 @@ def create_app():
     # ==========================================================================
     # LOGIKA PRE TAB 2 (TEXT NARRATION / MP3 S VIACHLASOVÝMI FRÁZAMI)
     # ==========================================================================
-    def task_generate_narration():
-        try:
-            speed = float(speed_combo.get())
-            lang_code = narr_lang_combo.get().split()[0]
-
-            if not narr_phrases:
-                parse_and_update_tab2_phrases(force_default=False)
-
-            if not narr_phrases:
-                messagebox.showerror("Error", "Input text is empty!")
-                return
-
-            narr_gen_btn.config(state="disabled")
-            narr_cancel_btn.config(state="normal")
-            narr_play_out_btn.config(state="disabled")
-            narr_save_btn.config(state="disabled")
-            narr_state["cancel_requested"] = False
-            prog_var.config(value=5)
-
-            log(f"[Narration] Starting multi-voice narration ({len(narr_phrases)} sentences, Language: {lang_code})...")
-
-            temp_narr_dir = os.path.join(SCRIPT_DIR, "output_narration")
-            os.makedirs(temp_narr_dir, exist_ok=True)
-
-            tot = len(narr_phrases)
-            audio_pieces = []
-            OUTPUT_SR = 44100
-            silence_sentence = np.zeros(int(OUTPUT_SR * 0.05), dtype=np.float32)
-
-            # Inicializujeme generátor
-            active_engine_obj = DynamicDubbingEngine(target_lang=lang_code, engine_type="supertonic")
-
-            for idx, item in enumerate(narr_phrases):
-                if narr_state["cancel_requested"]:
-                    break
-
-                chunk_text = item["text"].strip()
-                v_info = item["voice_info"]
-                v_type = v_info.get("type", "supertonic")
-                v_id = v_info.get("voice_id")
-                ref_wav = v_info.get("path") if v_type == "clone" else None
-
-                # Referenčný prepis pre klonovanie
-                if ref_wav and os.path.exists(ref_wav):
-                    get_or_create_reference_transcription(ref_wav, log_cb=log)
-
-                tmp_piece = os.path.join(temp_narr_dir, f"chunk_{idx:04d}.wav")
-                tmp_txt = os.path.join(temp_narr_dir, f"chunk_{idx:04d}.txt")
-
-                # Cache signature: voice type + voice ID/path + speed + phrase text
-                voice_sig = f"[{v_type}:{v_id or os.path.basename(ref_wav or '')}:{speed}]"
-                expected_cache = f"{voice_sig}\n{chunk_text}".strip()
-
-                cache_valid = False
-                if os.path.exists(tmp_piece) and os.path.getsize(tmp_piece) > 1000 and os.path.exists(tmp_txt):
-                    try:
-                        with open(tmp_txt, "r", encoding="utf-8-sig") as f:
-                            if f.read().strip() == expected_cache:
-                                cache_valid = True
-                    except Exception:
-                        cache_valid = False
-
-                if cache_valid:
-                    log(f"[Narration] ({idx+1}/{tot}) Using cached chunk ({item['voice_label'][:20]}): '{chunk_text[:35]}...'")
-                else:
-                    log(f"[Narration] ({idx+1}/{tot}) Synthesizing [{item['voice_label'][:25]}]: '{chunk_text[:35]}...'")
-                    active_engine_obj.generate_speech(
-                        text=chunk_text,
-                        spk_id="Narrator",
-                        ref_voice_wav=ref_wav,
-                        output_wav_path=tmp_piece,
-                        target_duration=None,
-                        log_cb=log,
-                        explicit_voice=v_id,
-                        explicit_engine=v_type
-                    )
-                    with open(tmp_txt, "w", encoding="utf-8") as f:
-                        f.write(expected_cache + "\n")
-
-                if os.path.exists(tmp_piece) and os.path.getsize(tmp_piece) > 1000:
-                    data, piece_sr = sf.read(tmp_piece)
-                    if len(data.shape) > 1:
-                        data = np.mean(data, axis=1)
-                    data = trim_audio_silence(data, piece_sr, db_thresh=30)
-                    
-                    if piece_sr != OUTPUT_SR:
-                        import math
-                        import scipy.signal
-                        g = math.gcd(int(OUTPUT_SR), int(piece_sr))
-                        up = int(OUTPUT_SR) // g
-                        down = int(piece_sr) // g
-                        data = scipy.signal.resample_poly(data, up, down)
-
-                    audio_pieces.append(data.astype(np.float32))
-                    audio_pieces.append(silence_sentence)
-
-                prog_var.config(value=int(10 + (idx + 1) / max(1, tot) * 80))
-
-            active_engine_obj.unload_model()
-
-            if narr_state["cancel_requested"]:
-                log("[Narration] Generation was cancelled.")
-                return
-
-            if not audio_pieces:
-                raise RuntimeError("Nepodarilo sa vytvoriť zvukovú stopu.")
-
-            combined = np.concatenate(audio_pieces)
-            max_v = np.max(np.abs(combined))
-            if max_v > 0:
-                combined = (combined / max_v) * 0.92
-
-            master_wav = os.path.join(temp_narr_dir, "master_narration.wav")
-            sf.write(master_wav, combined, OUTPUT_SR)
-
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            final_mp3 = os.path.join(temp_narr_dir, f"narration_{lang_code}_{ts}.mp3")
-            convert_to_mp3_160k(master_wav, final_mp3)
-
-            narr_state["last_mp3"] = final_mp3
-            prog_var.config(value=100)
-            narr_play_out_btn.config(state="normal")
-            narr_save_btn.config(state="normal")
-
-            dur = get_audio_duration(final_mp3)
-            log(f"[Done] MP3 audio ready ({dur:.1f} s).")
-            messagebox.showinfo("Done", f"Narration successfully generated!\n\nDuration: {dur:.1f} s\nFile: {final_mp3}")
-
-        except Exception as e:
-            log(f"[ERROR] {str(e)}")
-            messagebox.showerror("Error", f"Error during speech generation:\n{str(e)}")
-        finally:
-            narr_gen_btn.config(state="normal")
-            narr_cancel_btn.config(state="disabled")
-
-    def play_narr_output():
-        if narr_state["last_mp3"] and os.path.exists(narr_state["last_mp3"]):
-            data, sr = sf.read(narr_state["last_mp3"])
-            sd.stop()
-            sd.play(data, sr)
-
-    def save_narr_output():
-        if not (narr_state["last_mp3"] and os.path.exists(narr_state["last_mp3"])):
-            return
-        dest = filedialog.asksaveasfilename(
-            defaultextension=".mp3",
-            filetypes=[("MP3 Audio (160 kbps)", "*.mp3")]
-        )
-        if dest:
-            shutil.copy2(narr_state["last_mp3"], dest)
-            messagebox.showinfo("Saved", f"MP3 file was saved:\n{dest}")
-
     # Priradenie tlačidiel
     def reset_project_memory():
         v = video_entry.get().strip()
@@ -2084,17 +1717,13 @@ def create_app():
     export_work_btn.config(command=handle_export_work)
     import_work_btn.config(command=handle_import_work)
 
-    narr_gen_btn.config(command=lambda: threading.Thread(target=task_generate_narration, daemon=True).start())
-    narr_cancel_btn.config(command=lambda: narr_state.update({"cancel_requested": True}))
-    narr_play_out_btn.config(command=play_narr_output)
-    narr_save_btn.config(command=save_narr_output)
 
-    # Inicializácia roletiek a počiatočného stavu
     update_tab1_voices_dropdown()
     update_spk_voices_dropdown()
-    update_narr_voices_dropdown()
-    parse_and_update_tab2_phrases(force_default=False)
 
-    root.after(120, process_logs)
-    return root
-
+    return {
+        "tab_frame": tab_dubbing,
+        "update_voices": lambda: [update_tab1_voices_dropdown(), update_spk_voices_dropdown()],
+        "refresh_subtitles": refresh_subtitle_table,
+        "refresh_speakers": refresh_speaker_table
+    }

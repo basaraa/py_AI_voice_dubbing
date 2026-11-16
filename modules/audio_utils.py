@@ -343,8 +343,58 @@ def sort_treeview(tree, col, sort_state_dict):
 # 2. AUDIO EXTRACTION & DEMUCS SEPARATION
 # ==============================================================================
 
-def extract_audio_from_video(video_path, output_audio_path):
-    cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", output_audio_path]
+def get_video_audio_tracks(video_path):
+    """
+    Probes audio streams in a video/audio file using ffprobe.
+    Returns a list of dicts with 0-based audio stream index, codec, language, title, and is_ai_dub flag.
+    """
+    tracks = []
+    if not video_path or not os.path.exists(video_path):
+        return tracks
+    try:
+        cmd = [
+            "ffprobe", "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams", "-select_streams", "a",
+            video_path
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", shell=False)
+        if res.returncode != 0 or not res.stdout.strip():
+            return tracks
+        info = json.loads(res.stdout)
+        for idx, stream in enumerate(info.get("streams", [])):
+            tags = stream.get("tags", {}) or {}
+            title = str(tags.get("title", "") or tags.get("TITLE", "")).strip()
+            lang = str(tags.get("language", "") or tags.get("LANGUAGE", "und")).strip()
+            codec = str(stream.get("codec_name", "unknown")).strip()
+            is_ai_dub = "ai dubbing" in title.lower() or title.lower().startswith("ai dub")
+            tracks.append({
+                "index": idx,
+                "codec": codec,
+                "language": lang,
+                "title": title,
+                "is_ai_dub": is_ai_dub
+            })
+    except Exception:
+        pass
+    return tracks
+
+def pick_best_source_audio_track(tracks):
+    """
+    Selects the first non-AI-dubbing audio track index. Falls back to 0 if none found.
+    """
+    for t in tracks:
+        if not t.get("is_ai_dub", False):
+            return t["index"]
+    return 0
+
+def extract_audio_from_video(video_path, output_audio_path, audio_stream_index=None):
+    if audio_stream_index is None:
+        audio_stream_index = pick_best_source_audio_track(get_video_audio_tracks(video_path))
+    cmd = ["ffmpeg", "-y", "-i", video_path]
+    if audio_stream_index is not None:
+        cmd.extend(["-map", f"0:a:{int(audio_stream_index)}"])
+    cmd.extend(["-vn", "-acodec", "pcm_s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", output_audio_path])
     run_cmd(cmd)
     return output_audio_path
 

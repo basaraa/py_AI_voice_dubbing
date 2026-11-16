@@ -35,6 +35,7 @@ temp/
 tmp/
 output/
 outputs/
+output_narration/
 *.sqlite3
 *.db
 
@@ -125,5 +126,6 @@ Thumbs.db
 *.ass
 *.sup
 *_ai_dub/
+test*.txt
 speaker_profiles/*.npy
 speaker_profiles/profiles.json

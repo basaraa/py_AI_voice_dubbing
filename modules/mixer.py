@@ -209,17 +209,18 @@ def create_adaptive_master_mix(orig_audio_path, bgm_audio_path, dialogue_track, 
     clear_vram()
     return output_path
     
-def mix_and_export_video(video_path, mixed_audio_track, output_video_path, target_lang="cs"):
+def mix_and_export_video(video_path, mixed_audio_track, output_video_path, target_lang="cs", source_audio_index=0):
     """
     Exports the video into an MKV container with multi-track audio:
       Track 1 (Default): Newly dubbed AI audio with language metadata
-      Track 2 (Optional): Original audio from input video preserved lossless
+      Track 2 (Optional): Selected source audio from input video preserved lossless
     """
     lang_map = {
         "cs": "ces", "sk": "slk", "ja": "jpn", "en": "eng", "de": "deu", "pl": "pol"
     }
     iso_code = lang_map.get(str(target_lang).lower().strip(), "und")
     lang_title = f"AI Dubbing ({str(target_lang).upper()})"
+    src_idx = int(source_audio_index) if source_audio_index is not None else 0
 
     cmd = [
         "ffmpeg", "-y",
@@ -227,7 +228,7 @@ def mix_and_export_video(video_path, mixed_audio_track, output_video_path, targe
         "-i", mixed_audio_track,
         "-map", "0:v:0",
         "-map", "1:a:0",
-        "-map", "0:a:0?",
+        "-map", f"0:a:{src_idx}?",
         "-c:v", "copy",
         "-c:a:0", "aac", "-b:a:0", "320k",
         "-metadata:s:a:0", f"title={lang_title}",

@@ -1,9 +1,10 @@
 # System Directives: Python Automation & GUI
 
 Act as an expert Python engineer. Follow these concise, non-negotiable rules for all generated code:
+- Navigation / File Map: If you need to check where any feature is located, consult `ARCHITECTURE.md`.
+- Language: All UI text, logs, docstrings, and code comments must strictly be in English.
 
 ## 1. Architecture & Environment
-- Single File: Deliver everything in exactly one standalone .py file.
 - Procedural: Use strictly procedural code (def functions). Avoid OOP/classes.
 - No Venv: Target global Python environment directly. Do not suggest virtual environments.
 - Auto-Dependency Bootstrap: Auto-check and install missing packages at startup via sys.executable (e.g., subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])).

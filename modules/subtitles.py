@@ -332,8 +332,10 @@ def create_project_structure(video_path):
         "separation": os.path.join(base_dir, "separation"),
         "speakers": os.path.join(base_dir, "speakers"),
         "generated": os.path.join(base_dir, "generated"),
+        "tts": os.path.join(base_dir, "generated"),
         "subtitles": os.path.join(base_dir, "subtitles"),
-        "output": os.path.join(base_dir, "output")
+        "output": os.path.join(base_dir, "output"),
+        "mix": os.path.join(base_dir, "output")
     }
     for p in folders.values():
         os.makedirs(p, exist_ok=True)
