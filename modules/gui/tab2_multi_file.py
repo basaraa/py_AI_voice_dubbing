@@ -14,25 +14,19 @@ Procedural component for batch dubbing multiple subtitle/text files in Tab 2.
 import os
 import re
 import time
-import math
-import hashlib
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import numpy as np
-import soundfile as sf
-import sounddevice as sd
 
 from modules.config import (
-    SCRIPT_DIR, SAMPLE_RATE, SUPERTONIC_MALE_RANKED, SUPERTONIC_VOICE_CATALOG
+    SCRIPT_DIR, SUPERTONIC_MALE_RANKED, SUPERTONIC_VOICE_CATALOG
 )
 from modules.audio_utils import (
-    get_all_available_voices, convert_to_mp3_160k, trim_audio_silence,
-    get_audio_duration, sort_treeview, get_vram_status,
-    get_or_create_reference_transcription
+    get_all_available_voices, sort_treeview, get_vram_status
 )
 from modules.subtitles import extract_clean_text_from_srt, split_text_into_sentences_list
 from modules.tts import DynamicDubbingEngine, play_any_voice_sample
+from modules.narration_core import synthesize_narration_to_mp3
 
 
 def get_default_supertonic_voice(catalog, voice_map):
@@ -282,6 +276,13 @@ def create_tab2_multi_file(parent_frame, root, log_cb=print, prog_var=None, stat
         command=lambda: start_generation()
     )
     gen_btn.pack(side="left", padx=5)
+
+    disable_chunks_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(
+        action_bar,
+        text="Disable Chunk Files",
+        variable=disable_chunks_var
+    ).pack(side="left", padx=(10, 5))
 
     cancel_btn = ttk.Button(action_bar, text="⏹ Cancel", state="disabled", command=lambda: request_cancel())
     cancel_btn.pack(side="right", padx=5)
@@ -596,13 +597,9 @@ def create_tab2_multi_file(parent_frame, root, log_cb=print, prog_var=None, stat
         threading.Thread(target=run_generation_task, args=(enabled_files,), daemon=True).start()
 
     def run_generation_task(files_to_dub):
-        temp_narr_dir = os.path.join(SCRIPT_DIR, "output_narration")
-        os.makedirs(temp_narr_dir, exist_ok=True)
-
         lang_code = lang_combo.get().split()[0].lower()
         speed = speed_combo.get().strip() or "1.0"
-        OUTPUT_SR = 44100
-        silence_sentence = np.zeros(int(OUTPUT_SR * 0.05), dtype=np.float32)
+        disable_chunks = disable_chunks_var.get()
 
         total_files = len(files_to_dub)
         log_cb(f"[Multi-Dub] Starting multi-file dubbing for {total_files} file(s) (Language: {lang_code}, Speed: {speed})...")
@@ -628,103 +625,34 @@ def create_tab2_multi_file(parent_frame, root, log_cb=print, prog_var=None, stat
                 fdata["status"] = "Generating..."
                 root.after(0, lambda p=fp: files_tree.set(p, "status", "Generating..."))
 
-                audio_pieces = []
-                tot_s = len(sentences)
+                base_name = os.path.splitext(os.path.basename(fp))[0]
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                final_mp3 = os.path.join(SCRIPT_DIR, f"{base_name}_{ts}.mp3")
 
-                for s_idx, s in enumerate(sentences):
-                    if state["cancel_requested"]:
-                        break
-
-                    chunk_text = s["text"].strip()
-                    if not chunk_text:
-                        continue
-
-                    v_info = s["voice_info"]
-                    v_type = v_info.get("type", "supertonic")
-                    v_id = v_info.get("voice_id")
-                    ref_wav = v_info.get("path") if v_type == "clone" else None
-
-                    if ref_wav and os.path.exists(ref_wav):
-                        get_or_create_reference_transcription(ref_wav, log_cb=log_cb)
-
-                    voice_sig = f"[{v_type}:{v_id or os.path.basename(ref_wav or '')}:{speed}]"
-                    cache_content = f"{voice_sig}\n{chunk_text}".strip()
-                    cache_hash = hashlib.md5(cache_content.encode("utf-8")).hexdigest()[:16]
-
-                    tmp_piece = os.path.join(temp_narr_dir, f"chunk_{cache_hash}.wav")
-                    tmp_txt = os.path.join(temp_narr_dir, f"chunk_{cache_hash}.txt")
-
-                    cache_valid = False
-                    if os.path.exists(tmp_piece) and os.path.getsize(tmp_piece) > 1000 and os.path.exists(tmp_txt):
-                        try:
-                            with open(tmp_txt, "r", encoding="utf-8-sig") as cf:
-                                if cf.read().strip() == cache_content:
-                                    cache_valid = True
-                        except Exception:
-                            cache_valid = False
-
-                    if not cache_valid:
-                        active_engine.generate_speech(
-                            text=chunk_text,
-                            spk_id="Narrator",
-                            ref_voice_wav=ref_wav,
-                            output_wav_path=tmp_piece,
-                            target_duration=None,
-                            log_cb=log_cb,
-                            explicit_voice=v_id,
-                            explicit_engine=v_type
-                        )
-                        try:
-                            with open(tmp_txt, "w", encoding="utf-8") as cf:
-                                cf.write(cache_content + "\n")
-                        except Exception:
-                            pass
-
-                    if os.path.exists(tmp_piece) and os.path.getsize(tmp_piece) > 1000:
-                        data, piece_sr = sf.read(tmp_piece)
-                        if len(data.shape) > 1:
-                            data = np.mean(data, axis=1)
-                        data = trim_audio_silence(data, piece_sr, db_thresh=30)
-
-                        if piece_sr != OUTPUT_SR:
-                            import scipy.signal
-                            g = math.gcd(int(OUTPUT_SR), int(piece_sr))
-                            up = int(OUTPUT_SR) // g
-                            down = int(piece_sr) // g
-                            data = scipy.signal.resample_poly(data, up, down)
-
-                        audio_pieces.append(data.astype(np.float32))
-                        audio_pieces.append(silence_sentence)
-
-                    overall_pct = int(((f_idx + (s_idx + 1) / max(1, tot_s)) / total_files) * 95)
+                def on_file_progress(done_s, tot_s, cur_f=f_idx):
+                    overall_pct = int(((cur_f + done_s / max(1, tot_s)) / total_files) * 95)
                     if prog_var:
                         root.after(0, lambda v=overall_pct: prog_var.config(value=v))
 
-                if state["cancel_requested"]:
+                _, dur, cancelled = synthesize_narration_to_mp3(
+                    sentence_items=sentences,
+                    lang_code=lang_code,
+                    output_mp3_path=final_mp3,
+                    speed=speed,
+                    pause_sec=0.05,
+                    disable_chunks=disable_chunks,
+                    active_engine=active_engine,
+                    log_cb=log_cb,
+                    progress_cb=on_file_progress,
+                    cancel_check=lambda: state["cancel_requested"],
+                    log_prefix="[Multi-Dub]"
+                )
+
+                if cancelled:
                     fdata["status"] = "Cancelled"
                     root.after(0, lambda p=fp: files_tree.set(p, "status", "Cancelled"))
                     break
 
-                if not audio_pieces:
-                    log_cb(f"[Multi-Dub] Warning: No audio was generated for '{rel}'.")
-                    fdata["status"] = "No Audio"
-                    root.after(0, lambda p=fp: files_tree.set(p, "status", "No Audio"))
-                    continue
-
-                combined = np.concatenate(audio_pieces)
-                max_v = np.max(np.abs(combined))
-                if max_v > 0:
-                    combined = (combined / max_v) * 0.92
-
-                master_wav = os.path.join(temp_narr_dir, f"master_{f_idx:03d}.wav")
-                sf.write(master_wav, combined, OUTPUT_SR)
-
-                base_name = os.path.splitext(os.path.basename(fp))[0]
-                ts = time.strftime("%Y%m%d_%H%M%S")
-                final_mp3 = os.path.join(SCRIPT_DIR, f"{base_name}_{ts}.mp3")
-                convert_to_mp3_160k(master_wav, final_mp3)
-
-                dur = get_audio_duration(final_mp3)
                 fdata["status"] = "Done"
                 root.after(0, lambda p=fp: files_tree.set(p, "status", "Done"))
                 log_cb(f"[Multi-Dub] Auto-saved dubbed MP3 ({dur:.1f} s): {final_mp3}")

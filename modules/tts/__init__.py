@@ -38,12 +38,12 @@ class DynamicDubbingEngine:
         is_female = avg_f0 >= 175.0
         return random.choice(SUPERTONIC_FEMALE_VOICES) if is_female else random.choice(SUPERTONIC_MALE_VOICES)
 
-    def generate_speech(self, text, spk_id, ref_voice_wav, output_wav_path, target_duration=None, log_cb=print, explicit_voice=None, explicit_engine=None):
+    def generate_speech(self, text, spk_id, ref_voice_wav, output_wav_path, target_duration=None, log_cb=print, explicit_voice=None, explicit_engine=None, speed=1.0):
         if not text or not text.strip():
             sf.write(output_wav_path, np.zeros(int(SAMPLE_RATE * 0.2), dtype=np.float32), SAMPLE_RATE)
             return output_wav_path, "neutral"
 
-        calc_speed = 1.0
+        calc_speed = float(speed) if speed else 1.0
         if target_duration and target_duration > 0.5:
             needed = len(text) / 14.0
             if needed > target_duration:

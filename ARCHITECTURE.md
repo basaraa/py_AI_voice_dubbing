@@ -9,6 +9,7 @@ Quick navigation map for codebase structure and module responsibilities.
 ```text
 py_AI_voice_dubbing/
 ├── py_ai_voice_dubbing.py          # App entry point (launches modules.gui.create_app())
+├── cli_text_tts.py                 # Standalone CLI for Tab 2 text/.txt/.srt/.vtt -> MP3 only
 ├── AGENTS.md                       # Core system directives and developer rules
 ├── ARCHITECTURE.md                 # This navigation map
 │
@@ -18,6 +19,7 @@ py_AI_voice_dubbing/
     ├── subtitles.py                # SRT/VTT/ASS parsing, dialogue text extraction, sentence tokenizer
     ├── diarization.py              # Speaker segmentation, F0 pitch/gender analysis, voice matching
     ├── mixer.py                    # Audio mixer, Foley/SFX passthrough, ducking, video muxing
+    ├── narration_core.py           # Shared Tab 2 text/subtitle-to-MP3 synthesis core (GUI + CLI)
     ├── multi_file_narration.py     # Backward-compatible re-exporter for tab2_multi_file
     │
     ├── tts/                        # TTS ENGINES
@@ -42,6 +44,8 @@ py_AI_voice_dubbing/
 | Task / Feature | File Location | Responsibility |
 | :--- | :--- | :--- |
 | **App Launch** | `py_ai_voice_dubbing.py` | Bootstraps GUI via `create_app().mainloop()`. |
+| **CLI Text TTS** | `cli_text_tts.py` | Procedural CLI for Tab 2 text/subtitle-to-MP3 synthesis only (no video dubbing). |
+| **Narration Core** | `modules/narration_core.py` | Shared Tab 2 synthesis, chunk-disable/cache, and MP3 export logic for GUI & CLI. |
 | **Config & Voices** | `modules/config.py` | `SUPERTONIC_MALE_RANKED`, catalogs, thread-spin fixes, paths. |
 | **Audio Operations** | `modules/audio_utils.py` | `convert_to_mp3_160k`, `trim_audio_silence`, voice list scanner. |
 | **Subtitles & Text** | `modules/subtitles.py` | Clean dialogue extractor (`extract_clean_text_from_srt`), sentence tokenizer. |

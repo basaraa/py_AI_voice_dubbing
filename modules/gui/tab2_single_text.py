@@ -11,13 +11,11 @@ Procedural component for single text narration in Tab 2.
 import os
 import re
 import time
-import math
 import shutil
 import threading
 import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import numpy as np
 import soundfile as sf
 import sounddevice as sd
 
@@ -25,12 +23,11 @@ from modules.config import (
     SCRIPT_DIR, VOICES_DIR, SAMPLE_RATE
 )
 from modules.audio_utils import (
-    run_cmd, get_audio_duration, get_all_available_voices,
-    get_or_create_reference_transcription, trim_audio_silence,
-    convert_to_mp3_160k, sort_treeview
+    run_cmd, get_all_available_voices, sort_treeview
 )
 from modules.subtitles import extract_clean_text_from_srt, split_text_into_sentences_list
-from modules.tts import DynamicDubbingEngine, play_any_voice_sample
+from modules.tts import play_any_voice_sample
+from modules.narration_core import synthesize_narration_to_mp3
 
 
 def create_tab2_single_text(parent_frame, root, log_cb=print, prog_var=None, on_voice_added=None):
@@ -316,6 +313,13 @@ def create_tab2_single_text(parent_frame, root, log_cb=print, prog_var=None, on_
     narr_save_btn = ttk.Button(narr_action_f, text="💾 Save MP3 As...", state="disabled")
     narr_save_btn.pack(side="left", padx=5)
 
+    disable_chunks_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(
+        narr_action_f,
+        text="Disable Chunk Files",
+        variable=disable_chunks_var
+    ).pack(side="left", padx=(10, 5))
+
     narr_cancel_btn = ttk.Button(narr_action_f, text="⏹ Cancel", state="disabled")
     narr_cancel_btn.pack(side="right", padx=5)
 
@@ -341,100 +345,30 @@ def create_tab2_single_text(parent_frame, root, log_cb=print, prog_var=None, on_
 
             log_cb(f"[Narration] Starting multi-voice narration ({len(narr_phrases)} sentences, Language: {lang_code})...")
 
-            temp_narr_dir = os.path.join(SCRIPT_DIR, "output_narration")
-            os.makedirs(temp_narr_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            final_mp3 = os.path.join(SCRIPT_DIR, "output_narration", f"narration_{lang_code}_{ts}.mp3")
 
-            tot = len(narr_phrases)
-            audio_pieces = []
-            OUTPUT_SR = 44100
-            silence_sentence = np.zeros(int(OUTPUT_SR * 0.05), dtype=np.float32)
-
-            active_engine_obj = DynamicDubbingEngine(target_lang=lang_code, engine_type="supertonic")
-
-            for idx, item in enumerate(narr_phrases):
-                if narr_state["cancel_requested"]:
-                    break
-
-                chunk_text = item["text"].strip()
-                v_info = item["voice_info"]
-                v_type = v_info.get("type", "supertonic")
-                v_id = v_info.get("voice_id")
-                ref_wav = v_info.get("path") if v_type == "clone" else None
-
-                if ref_wav and os.path.exists(ref_wav):
-                    get_or_create_reference_transcription(ref_wav, log_cb=log_cb)
-
-                tmp_piece = os.path.join(temp_narr_dir, f"chunk_{idx:04d}.wav")
-                tmp_txt = os.path.join(temp_narr_dir, f"chunk_{idx:04d}.txt")
-
-                voice_sig = f"[{v_type}:{v_id or os.path.basename(ref_wav or '')}:{speed}]"
-                expected_cache = f"{voice_sig}\n{chunk_text}".strip()
-
-                cache_valid = False
-                if os.path.exists(tmp_piece) and os.path.getsize(tmp_piece) > 1000 and os.path.exists(tmp_txt):
-                    try:
-                        with open(tmp_txt, "r", encoding="utf-8-sig") as f:
-                            if f.read().strip() == expected_cache:
-                                cache_valid = True
-                    except Exception:
-                        cache_valid = False
-
-                if cache_valid:
-                    log_cb(f"[Narration] ({idx+1}/{tot}) Using cached chunk ({item['voice_label'][:20]}): '{chunk_text[:35]}...'")
-                else:
-                    log_cb(f"[Narration] ({idx+1}/{tot}) Synthesizing [{item['voice_label'][:25]}]: '{chunk_text[:35]}...'")
-                    active_engine_obj.generate_speech(
-                        text=chunk_text,
-                        spk_id="Narrator",
-                        ref_voice_wav=ref_wav,
-                        output_wav_path=tmp_piece,
-                        target_duration=None,
-                        log_cb=log_cb,
-                        explicit_voice=v_id,
-                        explicit_engine=v_type
-                    )
-                    with open(tmp_txt, "w", encoding="utf-8") as f:
-                        f.write(expected_cache + "\n")
-
-                if os.path.exists(tmp_piece) and os.path.getsize(tmp_piece) > 1000:
-                    data, piece_sr = sf.read(tmp_piece)
-                    if len(data.shape) > 1:
-                        data = np.mean(data, axis=1)
-                    data = trim_audio_silence(data, piece_sr, db_thresh=30)
-
-                    if piece_sr != OUTPUT_SR:
-                        import scipy.signal
-                        g = math.gcd(int(OUTPUT_SR), int(piece_sr))
-                        up = int(OUTPUT_SR) // g
-                        down = int(piece_sr) // g
-                        data = scipy.signal.resample_poly(data, up, down)
-
-                    audio_pieces.append(data.astype(np.float32))
-                    audio_pieces.append(silence_sentence)
-
+            def on_progress(done_idx, total_cnt):
                 if prog_var:
-                    prog_var.config(value=int(10 + (idx + 1) / max(1, tot) * 80))
+                    pct = int(10 + done_idx / max(1, total_cnt) * 90)
+                    root.after(0, lambda v=pct: prog_var.config(value=v))
 
-            active_engine_obj.unload_model()
+            _, dur, cancelled = synthesize_narration_to_mp3(
+                sentence_items=narr_phrases,
+                lang_code=lang_code,
+                output_mp3_path=final_mp3,
+                speed=speed,
+                pause_sec=0.05,
+                disable_chunks=disable_chunks_var.get(),
+                log_cb=log_cb,
+                progress_cb=on_progress,
+                cancel_check=lambda: narr_state["cancel_requested"],
+                log_prefix="[Narration]"
+            )
 
-            if narr_state["cancel_requested"]:
+            if cancelled:
                 log_cb("[Narration] Generation was cancelled.")
                 return
-
-            if not audio_pieces:
-                raise RuntimeError("Nepodarilo sa vytvoriť zvukovú stopu.")
-
-            combined = np.concatenate(audio_pieces)
-            max_v = np.max(np.abs(combined))
-            if max_v > 0:
-                combined = (combined / max_v) * 0.92
-
-            master_wav = os.path.join(temp_narr_dir, "master_narration.wav")
-            sf.write(master_wav, combined, OUTPUT_SR)
-
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            final_mp3 = os.path.join(temp_narr_dir, f"narration_{lang_code}_{ts}.mp3")
-            convert_to_mp3_160k(master_wav, final_mp3)
 
             narr_state["last_mp3"] = final_mp3
             if prog_var:
@@ -442,7 +376,6 @@ def create_tab2_single_text(parent_frame, root, log_cb=print, prog_var=None, on_
             narr_play_out_btn.config(state="normal")
             narr_save_btn.config(state="normal")
 
-            dur = get_audio_duration(final_mp3)
             log_cb(f"[Done] MP3 audio ready ({dur:.1f} s).")
             messagebox.showinfo("Done", f"Narration successfully generated!\n\nDuration: {dur:.1f} s\nFile: {final_mp3}")
 
